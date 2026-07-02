@@ -84,6 +84,16 @@ Play from the start of the game into the first combat world (Normandy). It
 should load instead of crashing to desktop. Helvetia and later worlds should
 work the same way.
 
+### Known limitation: flat terrain in Normandy / Helvetia / Egypt
+
+After the crash fix, those three worlds load but render with **untextured
+(flat) terrain**. This is a separate, deeper issue: their terrain uses 4096-wide
+"atlas" textures, and the Mac's legacy OpenGL context (under Rosetta) reports a
+`GL_MAX_TEXTURE_SIZE` below 4096, so those textures are skipped. The game is
+fully playable and completable; the terrain is just cosmetically flat in those
+worlds. Full root-cause analysis and the state of a possible fix are in
+[TERRAIN_NOTES.md](TERRAIN_NOTES.md).
+
 ### Undoing the patch
 
 ```bash
