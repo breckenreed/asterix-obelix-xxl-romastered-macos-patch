@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-Asterix & Obelix XXL: Romastered (macOS) -- "crash after Chapter 1" fix.
+Asterix & Obelix XXL: Romastered (macOS) -- "crash after Chapter 1" fixes.
 
-Root cause: the crashing function unconditionally decrements a reference
-count at [object + 0x250]. When entering ANY combat world (Normandy,
-Helvetia, ...) that object pointer is null, so the decrement dereferences
-address 0x250 and the game dies with EXC_BAD_ACCESS / SIGSEGV.
+Applies two independent binary patches to the shipped x86_64 game binary, both
+of which stop a hard crash when entering the combat worlds (Normandy, Helvetia,
+Egypt). Each patch is a self-contained detour into unused NOP alignment padding
+("code caves"); no code is appended and nothing in the file moves.
 
-This patches the function to check the pointer first and skip the whole
-body (jumping straight to the function's own epilogue) when it's null,
-instead of crashing. Everything else about the function is unchanged.
+  1. Null-deref refcount crash (FUN_100fa74d6). The function decrements a
+     refcount at [object + 0x250]; that object pointer is null on these worlds,
+     so it faults at address 0x250. The patch null-checks first and skips to the
+     function epilogue when null.
 
-IMPORTANT: this only works AFTER the separate launch-config fix described
-in README.md ("Step 1"). Run that first -- this script checks for it and
-refuses to run otherwise.
+  2. Texture config-index dispatch crash (FUN_1003dec5a, file offset 0x3df57d).
+     After uploading a texture, the function does an indirect jump through an
+     8-entry table indexed by a runtime "sampler config" field, texture[0xc0].
+     That field is constructor-initialised to -1 and is never set for some
+     textures (the first to fault in Normandy is an ordinary 16x16), so the
+     index is -1 and the jump lands on a wild address. The patch range-checks
+     the index and, when it is outside [0, 7], skips the whole sampler-config
+     block to the function epilogue (leaving GL default filtering, which renders
+     fine). See TERRAIN_NOTES.md for how this was isolated.
+
+Neither patch affects the (separate, unsolved) invisible slide/pre-fight terrain
+in those worlds; see TERRAIN_NOTES.md.
+
+IMPORTANT: this only works AFTER the separate launch-config fix described in
+README.md ("Step 1"). Run that first -- this script checks for it and refuses
+to run otherwise.
 
 Usage:
     python3 apply_patch.py
@@ -24,31 +38,32 @@ import subprocess
 import sys
 from pathlib import Path
 
-# --- patch locations, as file offsets (virtual_address - image_base 0x100000000) ---
-# ENTRY_OFFSET: start of "mov rbx,rsi; mov r14,rdi" inside the crashing function.
-#   Replaced with a 5-byte jmp into CAVE_A (+1 NOP filler byte).
-# CAVE_A_OFFSET / CAVE_B_OFFSET: two 16-byte runs of function-alignment NOP
-#   padding (dead space between unrelated functions, each immediately preceded
-#   by a `ud2` trap so nothing ever falls through into them), repurposed as a
-#   two-part code cave for the null-check detour.
-ENTRY_OFFSET = 0xFA74E1
-CAVE_A_OFFSET = 0x11291DB
-CAVE_B_OFFSET = 0x1123E89
-
-ORIGINAL = {
-    ENTRY_OFFSET: bytes.fromhex("4889f34989fe"),
-    CAVE_A_OFFSET: b"\x90" * 16,
-    CAVE_B_OFFSET: b"\x90" * 16,
-}
-
-# entry:  jmp CaveA ; nop
-# CaveA:  test esi,esi ; jz <function epilogue>  ; jmp CaveB ; nop*3
-# CaveB:  mov rbx,rsi ; mov r14,rdi (replayed originals) ; jmp <back to original code> ; nop*5
-PATCHED = {
-    ENTRY_OFFSET: bytes.fromhex("e9f51c180090"),
-    CAVE_A_OFFSET: bytes.fromhex("85f60f8487e3e7ffe9a1acffff909090"),
-    CAVE_B_OFFSET: bytes.fromhex("4889f34989fee95336e8ff9090909090"),
-}
+# Each patch is a set of regions: file_offset -> (original_hex, patched_hex).
+# File offset = virtual_address - image_base (0x100000000). The cave locations
+# are 16-byte runs of inter-function NOP alignment padding (each preceded by a
+# `ud2` trap, so nothing ever falls through into them). The two patches use
+# different caves and different hook sites, so they are fully independent.
+PATCHES = [
+    {
+        "name": "combat-world null-deref crash",
+        "regions": {
+            0xFA74E1: ("4889f34989fe", "e9f51c180090"),
+            0x11291DB: ("90" * 16, "85f60f8487e3e7ffe9a1acffff909090"),
+            0x1123E89: ("90" * 16, "4889f34989fee95336e8ff9090909090"),
+        },
+    },
+    {
+        # entry @0x3df56a: jmp CaveA ; nop ; nop  (replaces `mov eax,[r15+0xc0]`)
+        # CaveA: mov eax,[r15+0xc0] ; cmp eax,7 ; jmp CaveB
+        # CaveB: ja <epilogue 0x3decf7> ; jmp <resume 0x3df571>
+        "name": "texture config-index (0xc0) dispatch crash",
+        "regions": {
+            0x3DF56A: ("418b87c0000000", "e96607d4009090"),
+            0x111FCD5: ("90" * 16, "418b87c000000083f807e959993dff90"),
+            0x4F963D: ("90" * 16, "0f87b456eeffe9295feeff9090909090"),
+        },
+    },
+]
 
 BACKUP_SUFFIX = ".pre-crashfix-patch.bak"
 
@@ -90,8 +105,19 @@ def launch_fix_applied(app: Path, binary: Path) -> bool:
     return result.stdout.strip() == binary.name
 
 
-def region_matches(data: bytes, table: dict) -> bool:
-    return all(data[off:off + len(seq)] == seq for off, seq in table.items())
+def patch_state(data: bytes, patch: dict) -> str:
+    """Return 'applied', 'original', or 'unknown' for one patch's regions."""
+    applied = all(
+        data[off:off + len(bytes.fromhex(p))] == bytes.fromhex(p)
+        for off, (_o, p) in patch["regions"].items()
+    )
+    if applied:
+        return "applied"
+    original = all(
+        data[off:off + len(bytes.fromhex(o))] == bytes.fromhex(o)
+        for off, (o, _p) in patch["regions"].items()
+    )
+    return "original" if original else "unknown"
 
 
 def main():
@@ -107,43 +133,50 @@ def main():
             "Do Step 1 first, then re-run this script."
         )
 
-    data = binary.read_bytes()
+    data = bytearray(binary.read_bytes())
 
-    if region_matches(data, PATCHED):
-        print("Patch already applied -- nothing to do.")
-        return
+    states = {p["name"]: patch_state(data, p) for p in PATCHES}
+    for name, state in states.items():
+        print(f"  {name}: {state}")
+    print()
 
-    if not region_matches(data, ORIGINAL):
+    if any(s == "unknown" for s in states.values()):
         sys.exit(
-            "This binary's bytes at the patch locations don't match what this "
-            "patch expects (neither the original nor the already-patched form).\n\n"
+            "At least one patch location doesn't match either the original or "
+            "the already-patched bytes this script expects.\n\n"
             "This most likely means Steam shipped a different build/version than "
-            "the one this patch was made for. Refusing to modify the file -- "
+            "the one these patches were made for. Refusing to modify the file -- "
             "nothing has been changed.\n\n"
             "Please open an issue on the repo with your game's build info "
             "(Steam -> right-click game -> Properties -> Installed Files)."
         )
 
+    to_apply = [p for p in PATCHES if states[p["name"]] == "original"]
+    if not to_apply:
+        print("All patches already applied -- nothing to do.")
+        return
+
     backup = binary.with_name(binary.name + BACKUP_SUFFIX)
     if not backup.exists():
-        backup.write_bytes(data)
+        backup.write_bytes(bytes(data))
         print(f"Backed up original binary to:\n  {backup.name}\n")
     else:
         print(f"Backup already exists ({backup.name}), leaving it as-is.\n")
 
-    patched = bytearray(data)
-    for off, seq in PATCHED.items():
-        patched[off:off + len(seq)] = seq
-    binary.write_bytes(bytes(patched))
-    print("Patch written.")
+    for patch in to_apply:
+        for off, (_o, p) in patch["regions"].items():
+            seq = bytes.fromhex(p)
+            data[off:off + len(seq)] = seq
+        print(f"Applied: {patch['name']}")
+    binary.write_bytes(bytes(data))
 
-    print("Re-signing (ad-hoc)...")
+    print("\nRe-signing (ad-hoc)...")
     subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app)], check=True)
     subprocess.run(["codesign", "--verify", "--verbose", str(app)], check=True)
 
     print()
     print("Done. Launch the game from Steam as usual -- Normandy, Helvetia, and")
-    print("other combat worlds should now load instead of crashing.")
+    print("the other combat worlds should now load instead of crashing.")
     print()
     print("If Steam's 'Verify integrity of game files' is ever run, it will undo")
     print("this patch (and Step 1). Just re-run Step 1 and this script again.")

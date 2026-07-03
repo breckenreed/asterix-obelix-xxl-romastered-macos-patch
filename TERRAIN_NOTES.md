@@ -1,10 +1,15 @@
 # Terrain textures missing in Normandy / Helvetia / Egypt (macOS)
 
-Status: **root cause identified and confirmed in code; a clean fix is not yet
-available.** This document records the investigation so it can be finished by
-anyone with the game's cooking tools or more patience for the cooked-texture
-format. The main crash fix in this repo is unaffected and the game is fully
-playable start to finish.
+> **Note:** the two sections immediately below (the `GL_MAX_TEXTURE_SIZE` size
+> theory and the downscale/re-bake plan) were the first investigation and are
+> now known to be **wrong**. Read them for history, but see
+> "Final update: the size theory is wrong, and what is actually left" at the
+> bottom for the corrected conclusion. The crash fixes in this repo are
+> unaffected and the game is fully playable start to finish.
+
+Status: the load-time crashes are fixed (see `apply_patch.py`); the only
+remaining cosmetic issue is invisible slide / pre-fight terrain in these three
+worlds, which is a Mac-specific mesh-rendering problem (details at the bottom).
 
 ## Symptom
 
@@ -244,8 +249,43 @@ two targeted options exist, neither needing the cooking tools:
    the working textures carry, so the correct post-upload configuration routine
    runs.
 
-Note: an earlier build that simply guarded the dispatch (option 1) stopped the
-crash but left terrain black, which indicates the skipped configuration (or the
-data path it drives) is needed for the terrain to sample correctly. Initialising
-the index (option 2) is therefore the more promising route and is the focus of
-ongoing work.
+Option 1 (guard the dispatch) is what ships in `apply_patch.py`. The `0xc0`
+block only sets sampler state (min/mag filter via `glTexParameteri` with
+`GL_TEXTURE_MIN/MAG_FILTER`, then anisotropy); it uploads nothing, so skipping
+it when the index is invalid just leaves GL default filtering. It stops the
+crash and does not blank any texture.
+
+## Final update: the size theory is wrong, and what is actually left
+
+Testing the shipped state (both crash guards, native textures) settled the rest:
+
+- **4096 textures are fine on this Mac.** Worlds 1 (Gaul), 3 (Greece) and 6
+  (Rome) keep their 4096-wide atlas terrain and render it correctly. If 4096
+  were over the limit, their terrain would fail too. The `GL_MAX_TEXTURE_SIZE`
+  size theory at the top of this document is therefore **wrong**: the guard in
+  `FUN_1003dec5a` that compares against `glctx[0x444]` is real, but the reported
+  max is not below 4096 and it is not what breaks these worlds.
+
+- **Downscaling the atlas textures is a dead end and actively harmful.** The
+  `rebake_textures.py` / downscale approach (halve to 2048, reuse mip-1, borrow
+  a native footer) produces files that *load* but render **black/incorrect** in
+  remastered mode. It corrupts working art and fixes nothing. Do not use it; the
+  originals should be left at 4096. (`rebake_textures.py` is kept only as a
+  record of the dead end.)
+
+- **What actually remains: invisible slide / pre-fight terrain.** With the crash
+  fixed and native textures in place, the three worlds render correctly *except*
+  the ground meshes in the "slide" and pre-fight-arena sections, which are
+  invisible (you see sky through them) while still being walkable/slidable.
+  Established: the geometry's collision loads (objects rest on it, the player
+  slides), every level section references the **same** terrain material
+  (`Materials/Remaster/rmt_No_roch_sol_S01_P0` plus the grass materials), all
+  section streams are intact, and it is invisible in **both** the original and
+  remastered graphics modes. Same material renders in some places and not
+  others, in both modes, so this is not a texture/atlas/material/shader-mode
+  problem. It is a **Mac-specific mesh-rendering issue**: specific terrain meshes
+  are dropped from the visual pass (not rasterised) while collision is
+  unaffected. Pinning down which meshes and why needs runtime render inspection,
+  which is awkward here because attaching `lldb` to this Rosetta process makes
+  the running game unable to read its own save files (the save files on disk are
+  fine; only the debugged process cannot see them). That is the open frontier.

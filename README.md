@@ -84,15 +84,22 @@ Play from the start of the game into the first combat world (Normandy). It
 should load instead of crashing to desktop. Helvetia and later worlds should
 work the same way.
 
-### Known limitation: flat terrain in Normandy / Helvetia / Egypt
+### Known limitation: invisible slide / pre-fight terrain in Normandy / Helvetia / Egypt
 
-After the crash fix, those three worlds load but render with **untextured
-(flat) terrain**. This is a separate, deeper issue: their terrain uses 4096-wide
-"atlas" textures, and the Mac's legacy OpenGL context (under Rosetta) reports a
-`GL_MAX_TEXTURE_SIZE` below 4096, so those textures are skipped. The game is
-fully playable and completable; the terrain is just cosmetically flat in those
-worlds. Full root-cause analysis and the state of a possible fix are in
-[TERRAIN_NOTES.md](TERRAIN_NOTES.md).
+After the crash fixes, those three worlds load and their terrain renders
+correctly, **except** for the ground in the "slide" and pre-fight-arena
+sections, which is invisible: you can still walk and slide on it (its collision
+is present), only the visual mesh is missing, in both the original and
+remastered graphics modes.
+
+This is a separate, still-unsolved issue, and it is **not** a texture problem.
+The other three worlds use the same 4096-wide "atlas" terrain textures and
+render fine, so those textures are not too large for this Mac build, and every
+terrain section uses the same material. It is a Mac-specific mesh-rendering
+issue affecting those particular terrain meshes. The full investigation,
+including dead ends (notably an earlier "downscale the atlas textures" idea that
+actually corrupts them and fixes nothing), is in
+[TERRAIN_NOTES.md](TERRAIN_NOTES.md). The game is fully playable and completable.
 
 ### Undoing the patch
 
@@ -189,6 +196,32 @@ largest single padding gap found in this binary is 16. Rather than grow the
 file (which means rewriting Mach-O load commands and is a lot more invasive
 for a 3-byte savings), the logic is split across two 16-byte gaps chained by
 a `jmp`.
+
+### The second crash: texture config-index dispatch
+
+`apply_patch.py` also applies a second, independent crash fix in the texture
+upload function (`FUN_1003dec5a`, file offset `0x3df57d`). After uploading a
+texture the function configures its sampler state via an indirect jump through
+an 8-entry table indexed by a runtime field, `texture[0xc0]`:
+
+```
+mov    eax, [r15 + 0xc0]        ; eax = texture[0xc0]  (sampler-config index)
+lea    rcx, [rip + ...]         ; rcx = jump-table base (8 entries)
+movsxd rax, [rcx + 4*rax]       ; <-- faults when the index is garbage
+add    rax, rcx
+jmp    rax
+```
+
+That field is initialised to `-1` by the texture constructor and is never set
+for some textures. When it is still `-1`, `4*rax` addresses far outside the
+8-entry table and the indirect jump reads a wild address and crashes. (The
+first texture to hit this in Normandy is an ordinary 16x16 whose pixel data and
+format are otherwise valid.) The patch range-checks the index and, when it is
+outside `[0, 7]`, skips the whole sampler-config block to the function's
+epilogue, leaving GL default filtering, which renders correctly. Same
+two-16-byte-cave technique as above. How this was isolated (without a debugger,
+which corrupts save access on this game) is documented in
+[TERRAIN_NOTES.md](TERRAIN_NOTES.md).
 
 ### Compatibility
 
