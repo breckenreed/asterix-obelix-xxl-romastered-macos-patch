@@ -163,3 +163,89 @@ reference for continuation, and it always backs up originals before writing.
   breakpoints (`breakpoint set -H`) insert but resuming can still destabilise
   the process. The confirmations above are from breakpoints in the game binary
   plus static analysis, not GL-layer tracing.
+
+## Update (live debugging): the load-time crash is a distinct bug from the 4096 limit
+
+The size-limit analysis above explains the **flat terrain** (oversized 4096
+atlas maps are skipped by the `GL_MAX_TEXTURE_SIZE` guard). Later live debugging
+of the texture-upload path isolated the **load-time crash** as a *separate*
+fault with a different mechanism, and corrects part of the footer theory above.
+
+### Method (no debugger attach)
+
+Attaching `lldb` destabilises this Rosetta process and, as observed here, makes
+the running game unable to see its own save files while a debugger is attached
+(the save files on disk are untouched; only the attached process fails to read
+them). To avoid that, the crashing texture was inspected **without** attaching a
+debugger at all:
+
+- A short code-cave detour is written into the upload function immediately
+  before the faulting instruction. It copies one chosen field of the live
+  texture object into an otherwise-unused register (`r14`), then falls through
+  to the original crash.
+- The value is read back out of the **OS-generated crash report** (`.ips`),
+  whose thread state records every register at the moment of the fault.
+
+This leaks one 64-bit field per crash with no runtime instrumentation and no
+effect on saves. It was used to read the texture's dimensions, format enum,
+config index and pixel-data pointer across successive crashes.
+
+### What the crash actually is
+
+Faulting instruction, at file offset `0x3df57d` inside `FUN_1003dec5a`:
+
+```
+mov    eax, [r15 + 0xc0]        ; eax = texture[0xc0]  (config index)
+lea    rcx, [rip + ...]         ; rcx = jump-table base (DAT_1003df6a0, 8 entries)
+movsxd rax, [rcx + 4*rax]       ; <-- faults
+add    rax, rcx
+jmp    rax
+```
+
+It is a relative jump-table dispatch indexed by `texture[0xc0]`. Register values
+leaked at the fault:
+
+| field                        | value        | meaning                                            |
+|------------------------------|--------------|----------------------------------------------------|
+| `texture[0xc0]` (index)      | `0xffffffff` | -1, never initialised                              |
+| `texture[0xbc]` (upload fmt) | `0`          | valid: the uncompressed-RGBA path (`glTexImage2D` runs) |
+| `texture[0xa8]` (pixel data) | non-null     | the pixel data *is* loaded                          |
+| `texture` width x height     | `16 x 16`    | a small texture, not a 4096/2048 atlas map         |
+
+`texture[0xc0]` is a **runtime** field: the constructor (`FUN_100c06200`) sets it
+to `-1`, and the load path never updates it for these textures. With the index at
+`-1`, `4*rax` addresses far outside the 8-entry table and the indirect jump reads
+a wild address.
+
+### Corrections to the record
+
+- **The crash is not caused by the 4096 size limit.** The faulting texture is
+  16x16 and reaches the dispatch through the *normal* upload path (it passes the
+  `GL_MAX_TEXTURE_SIZE` guard). The size limit still explains the flat terrain,
+  but it is a separate failure from this crash.
+- **`texture[0xc0]` is not read from the cooked-file footer.** It is a
+  constructor-initialised runtime field. Byte-perfect downscaled atlas files
+  (correct header + promoted mip chain + a footer copied verbatim from a real
+  native 2048 texture of the same size/format, i.e. structurally identical to a
+  file the engine loads fine) still hit this crash. So "footer misalignment
+  corrupts `texture + 0xc0`" was not the mechanism; the field is simply never
+  set for these textures.
+- The affected textures are not only the atlas maps: the first one to fault is an
+  ordinary 16x16 texture with a valid format and loaded data.
+
+### Where a fix should go
+
+Only `texture[0xc0]` is wrong (format and data are both valid and present), so
+two targeted options exist, neither needing the cooking tools:
+
+1. **Guard the dispatch.** Skip the indexed jump when `texture[0xc0]` is outside
+   `[0, 7]`. This is a small binary patch in `FUN_1003dec5a`.
+2. **Initialise the index.** Set `texture[0xc0]` from `texture[0xbc]` / the value
+   the working textures carry, so the correct post-upload configuration routine
+   runs.
+
+Note: an earlier build that simply guarded the dispatch (option 1) stopped the
+crash but left terrain black, which indicates the skipped configuration (or the
+data path it drives) is needed for the terrain to sample correctly. Initialising
+the index (option 2) is therefore the more promising route and is the focus of
+ongoing work.
