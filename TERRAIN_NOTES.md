@@ -289,3 +289,8 @@ Testing the shipped state (both crash guards, native textures) settled the rest:
   which is awkward here because attaching `lldb` to this Rosetta process makes
   the running game unable to read its own save files (the save files on disk are
   fine; only the debugged process cannot see them). That is the open frontier.
+
+  A full log of the follow-up investigation into that invisible slide /
+  pre-fight terrain (the draw path, six ruled-out hypotheses with the exact test
+  for each, the debugger-free probe technique, and what a fix would need) is in
+  [SLIDE_TERRAIN_INVESTIGATION.md](SLIDE_TERRAIN_INVESTIGATION.md).
